@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PCA + Cluster Analyzer</title>
+<style>
+  :root { font-family: system-ui, sans-serif; color:#111827; background:#f1f5f9; }
+  body { margin:0; padding:16px; }
+  h1 { font-size:1.3rem; margin:0 0 4px; }
+  .sub { color:#64748b; font-size:.85rem; margin-bottom:12px; }
+  .card { background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:14px; }
+  textarea { width:100%; height:180px; font-family:ui-monospace,monospace; font-size:12px; border:1px solid #cbd5e1; border-radius:8px; padding:8px; box-sizing:border-box; }
+  .controls { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-top:10px; }
+  label { font-size:.8rem; display:block; color:#334155; margin-bottom:2px; }
+  select, input[type=number] { padding:5px 8px; border:1px solid #cbd5e1; border-radius:6px; font-size:.85rem; }
+  button { background:#2563eb; color:#fff; border:none; border-radius:8px; padding:8px 18px; font-size:.9rem; cursor:pointer; }
+  button:hover { background:#1d4ed8; }
+  .err { color:#b91c1c; font-size:.85rem; margin-top:8px; white-space:pre-wrap; }
+  canvas { max-width:100%; background:#fff; border-radius:8px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width: 800px){ .grid { grid-template-columns:1fr; } }
+  .metric { display:flex; justify-content:space-between; border-bottom:1px dashed #e2e8f0; padding:5px 0; font-size:.9rem; }
+  .metric b { font-variant-numeric:tabular-nums; }
+  .bar { height:10px; background:#e2e8f0; border-radius:5px; overflow:hidden; margin:4px 0 10px; }
+  .bar>div { height:100%; background:#2563eb; }
+  table { border-collapse:collapse; font-size:.8rem; width:100%; }
+  th, td { border:1px solid #e2e8f0; padding:3px 7px; text-align:right; }
+  th { background:#f8fafc; }
+  .cluster-legend { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:4px; }
+  .note { font-size:.78rem; color:#64748b; margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>PCA + Cluster Analyzer</h1>
+<div class="sub">Paste your matrix (tab, comma, semicolon or whitespace separated). The first 4 columns (index, day name, datetime, hour) are treated as row labels and ignored by the analysis. Columns 5+ are standardized, PCA-reduced and clustered.</div>
+
+<div class="card">
+  <textarea id="input" placeholder="idx  day  datetime  hour  v1  v2  v3 ..."></textarea>
+  <div class="controls">
+    <div><label for="k">Clusters (k)</label>
+      <select id="kmode">
+        <option value="auto">Auto (best silhouette, 2–8)</option>
+        <option value="2">2</option><option value="3">3</option><option value="4">4</option>
+        <option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option>
+      </select>
+    </div>
+    <div><label for="ncomp">PCA components</label>
+      <select id="ncomp"><option value="2">2</option><option value="3" selected>3</option><option value="0">All</option></select>
+    </div>
+    <div><label for="iters">k-means restarts</label><input type="number" id="iters" value="25" min="1" max="200" style="width:70px"></div>
+    <button id="run">Analyze</button>
+  </div>
+  <div class="err" id="err"></div>
+</div>
+
+<div id="results" style="display:none">
+  <div class="card"><h2 style="font-size:1rem;margin:0 0 8px">Clustering randomness / structure</h2>
+    <div class="grid">
+      <div>
+        <div class="metric"><span>Hopkins statistic (0.5 = random, &gt;0.7 = clusterable)</span><b id="hopkins"></b></div>
+        <div class="bar"><div id="hopkinsBar"></div></div>
+        <div class="metric"><span>Silhouette score of clustering</span><b id="sil"></b></div>
+        <div class="bar"><div id="silBar"></div></div>
+        <div class="metric"><span>Mean silhouette of 200 random labelings (baseline)</span><b id="randSil"></b></div>
+        <div class="metric"><span>Z-score vs. random labelings</span><b id="zscore"></b></div>
+        <div class="metric"><span>Structure verdict</span><b id="verdict"></b></div>
+      </div>
+      <div>
+        <div class="metric"><span>Rows clustered</span><b id="nrows"></b></div>
+        <div class="metric"><span>Rows dropped (non-equal columns)</span><b id="ndropped"></b></div>
+        <div class="metric"><span>Features used</span><b id="nfeat"></b></div>
+        <div class="metric"><span>PCA components used (variance kept)</span><b id="ncompUsed"></b></div>
+        <div class="metric"><span>Clusters (k)</span><b id="kUsed"></b></div>
+        <div class="metric"><span>Cluster sizes</span><b id="sizes"></b></div>
+      </div>
+    </div>
+    <div class="note" id="interp"></div>
+  </div>
+  <div class="card"><div class="grid">
+    <div><h2 style="font-size:.95rem;margin:0 0 6px">PC1 vs PC2</h2><canvas id="plot12" width="520" height="400"></canvas></div>
+    <div><h2 style="font-size:.95rem;margin:0 0 6px">PC1 vs PC3</h2><canvas id="plot13" width="520" height="400"></canvas></div>
+  </div></div>
+  <div class="card"><h2 style="font-size:.95rem;margin:0 0 8px">Clustered rows (first 4 label columns + assignment)</h2>
+    <div style="max-height:320px;overflow:auto"><table id="tbl"></table></div>
+  </div>
+  <div class="card"><h2 style="font-size:.95rem;margin:0 0 8px">Year calendar (days colored by cluster)</h2>
+    <div id="calendar" style="display:flex;flex-wrap:wrap;gap:14px"></div>
+    <div id="calLegend" style="margin-top:10px;font-size:.8rem"></div>
+    <div class="note">A day is painted with the majority cluster of its rows; days with mixed clusters show the split, and days with no data stay grey.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ---------- parsing ----------
+function parseMatrix(text){
+  const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length);
+  if(lines.length < 2) throw new Error("Need at least 2 data lines.");
+  let rows=[];
+  for(const line of lines){
+    let cells;
+    if(/\t/.test(line)) cells = line.split(/\t+/);
+    else if(/;/.test(line)) cells = line.split(/;/);
+    else if(/,/.test(line)) cells = line.split(/,/);
+    else cells = line.trim().split(/\s+/);
+    rows.push(cells.map(c=>c.trim()));
+  }
+  // Drop non-equal rows: keep only rows matching the most common column count
+  const counts = {};
+  for(const r of rows) counts[r.length] = (counts[r.length]||0)+1;
+  let w=0, best=0;
+  for(const [len,c] of Object.entries(counts)) if(c>best || (c===best && +len>w)){best=c;w=+len;}
+  const before = rows.length;
+  rows = rows.filter(r=>r.length===w);
+  const dropped = before - rows.length;
+  if(dropped>0) console.warn("Dropped "+dropped+" rows with non-matching column counts.");
+  if(w < 6) throw new Error("Need at least 6 columns: 4 label columns + 2 numeric features.");
+  const feats=[];
+  for(const r of rows){
+    const vals = r.slice(4).map(Number);
+    if(vals.some(v=>!isFinite(v))) throw new Error("Column 5 onward must be numeric. Bad row: "+r.slice(0,4).join(" | "));
+    feats.push(vals);
+  }
+  return {labels: rows.map(r=>r.slice(0,4)), X: feats, nFeat: w-4, dropped};
+}
+
+// ---------- stats ----------
+function mean(a){return a.reduce((s,v)=>s+v,0)/a.length;}
+function standardize(X){
+  const d=X[0].length, n=X.length;
+  const m=[], sd=[];
+  for(let j=0;j<d;j++){const col=X.map(r=>r[j]); const mu=mean(col);
+    const s=Math.sqrt(col.reduce((s,v)=>s+(v-mu)*(v-mu),0)/n)||1; m.push(mu); sd.push(s);}
+  return X.map(r=>r.map((v,j)=>(v-m[j])/sd[j]));
+}
+function matMul(A,B){const n=A.length,m=B[0].length,p=B.length;const C=[];
+  for(let i=0;i<n;i++){C[i]=[];for(let j=0;j<m;j++){let s=0;for(let k=0;k<p;k++)s+=A[i][k]*B[k][j];C[i][j]=s;}}return C;}
+function cov(X){const n=X.length,d=X[0].length;const C=[];
+  for(let i=0;i<d;i++){C[i]=[];for(let j=0;j<d;j++){let s=0;for(let k=0;k<n;k++)s+=X[k][i]*X[k][j];C[i][j]=s/(n-1);}}return C;}
+
+// Jacobi eigenvalue decomposition of symmetric matrix
+function jacobi(Ain, maxSweeps=100){
+  const n=Ain.length; const A=Ain.map(r=>r.slice());
+  let V=[]; for(let i=0;i<n;i++){V[i]=[];for(let j=0;j<n;j++)V[i][j]=i===j?1:0;}
+  for(let sweep=0;sweep<maxSweeps;sweep++){
+    let off=0;
+    for(let p=0;p<n-1;p++)for(let q=p+1;q<n;q++)off+=A[p][q]*A[p][q];
+    if(off<1e-14) break;
+    for(let p=0;p<n-1;p++)for(let q=p+1;q<n;q++){
+      if(Math.abs(A[p][q])<1e-15) continue;
+      const theta=(A[q][q]-A[p][p])/(2*A[p][q]);
+      const t=Math.sign(theta)/(Math.abs(theta)+Math.sqrt(theta*theta+1))||1;
+      const c=1/Math.sqrt(t*t+1), s=t*c;
+      for(let k=0;k<n;k++){
+        const akp=A[k][p], akq=A[k][q];
+        A[k][p]=c*akp-s*akq; A[k][q]=s*akp+c*akq;
+      }
+      for(let k=0;k<n;k++){
+        const apk=A[p][k], aqk=A[q][k];
+        A[p][k]=c*apk-s*aqk; A[q][k]=s*apk+c*aqk;
+      }
+      for(let k=0;k<n;k++){
+        const vkp=V[k][p], vkq=V[k][q];
+        V[k][p]=c*vkp-s*vkq; V[k][q]=s*vkp+c*vkq;
+      }
+    }
+  }
+  const eig=[]; for(let i=0;i<n;i++)eig.push({val:A[i][i], vec:V.map(r=>r[i])});
+  eig.sort((a,b)=>b.val-a.val);
+  return eig;
+}
+function pca(X, nComp){
+  const Z=standardize(X);
+  const eig=jacobi(cov(Z));
+  const total=eig.reduce((s,e)=>s+Math.max(0,e.val),0);
+  let k = nComp===0 ? eig.length : Math.min(nComp, eig.length);
+  // keep components with non-trivial variance
+  const kept=[]; for(let i=0;i<k;i++){ if(eig[i].val<=1e-10 && i>0) break; kept.push(eig[i]); }
+  const P=kept.map(e=>e.vec); // k x d
+  const scores=matMul(Z, P[0].map((_,j)=>P.map(r=>r[j]))); // n x k
+  const varKept=kept.reduce((s,e)=>s+Math.max(0,e.val),0)/total;
+  return {scores, varKept, k:kept.length, total:eig.length};
+}
+
+// ---------- clustering ----------
+function dist2(a,b){let s=0;for(let i=0;i<a.length;i++){const d=a[i]-b[i];s+=d*d;}return s;}
+function kmeans(D,k,restarts){
+  const n=D.length, dim=D[0].length;
+  let best=null;
+  for(let r=0;r<restarts;r++){
+    // k-means++ init
+    const cents=[D[Math.floor(Math.random()*n)].slice()];
+    while(cents.length<k){
+      const d2=D.map(p=>Math.min(...cents.map(c=>dist2(p,c))));
+      const tot=d2.reduce((a,b)=>a+b,0);
+      let x=Math.random()*tot, idx=0;
+      for(let i=0;i<n;i++){x-=d2[i]; if(x<=0){idx=i;break;}}
+      cents.push(D[idx].slice());
+    }
+    let labels=new Array(n).fill(0), changed=true, guard=0;
+    while(changed && guard++<300){
+      changed=false;
+      for(let i=0;i<n;i++){
+        let bi=0,bd=Infinity;
+        for(let j=0;j<k;j++){const d=dist2(D[i],cents[j]);if(d<bd){bd=d;bi=j;}}
+        if(labels[i]!==bi){labels[i]=bi;changed=true;}
+      }
+      const sum=[];for(let j=0;j<k;j++){sum[j]=new Array(dim).fill(0);let c=0;
+        for(let i=0;i<n;i++)if(labels[i]===j){c++;for(let d2i=0;d2i<dim;d2i++)sum[j][d2i]+=D[i][d2i];}
+        cents[j]= c? sum[j].map(v=>v/c) : D[Math.floor(Math.random()*n)].slice();}
+    }
+    let inertia=0;
+    for(let i=0;i<n;i++)inertia+=dist2(D[i],cents[labels[i]]);
+    if(!best||inertia<best.inertia)best={labels,inertia};
+  }
+  return best;
+}
+function silhouette(D,labels,k){
+  const n=D.length; if(k<2||n<=k) return 0;
+  const byC=[]; for(let j=0;j<k;j++)byC.push(labels.map((l,i)=>l===j?i:-1).filter(i=>i>=0));
+  let total=0;
+  for(let i=0;i<n;i++){
+    const own=byC[labels[i]].filter(x=>x!==i);
+    if(own.length===0){continue;}
+    const a=own.reduce((s,j)=>s+Math.sqrt(dist2(D[i],D[j])),0)/own.length;
+    let b=Infinity;
+    for(let j=0;j<k;j++){ if(j===labels[i])continue;
+      const idx=byC[j]; if(!idx.length)continue;
+      const m=idx.reduce((s,x)=>s+Math.sqrt(dist2(D[i],D[x])),0)/idx.length;
+      if(m<b)b=m;}
+    total += (b-a)/Math.max(a,b);
+  }
+  return total/n;
+}
+function hopkins(D){
+  // sample size
+  const n=D.length, dim=D[0].length;
+  const m=Math.min(Math.max(3,Math.floor(n/10)),n-1);
+  const mins=D.map(p=>Math.min(...p)), maxs=D.map(p=>Math.max(...p));
+  function nnDist(p){let bd=Infinity;for(const q of D){const d=dist2(p,q);if(d<bd)bd=d;}return bd;}
+  let u=0;
+  for(let i=0;i<m;i++){const p=[];for(let d=0;d<dim;d++)p.push(mins[d]+Math.random()*(maxs[d]-mins[d]));u+=nnDist(p);}
+  let w=0;
+  const used=new Set();
+  for(let i=0;i<m;i++){let idx;do{idx=Math.floor(Math.random()*n);}while(used.has(idx));used.add(idx);
+    let bd=Infinity;for(let j=0;j<n;j++){if(j===idx)continue;const d=dist2(D[idx],D[j]);if(d<bd)bd=d;}w+=bd;}
+  const U=u/m, W=w/m;
+  return U/(U+W);
+}
+function mulberry(seed){return function(){seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+// ---------- plotting ----------
+function scatter(cv, D, labels, k, ai, bi, na, nb, ev){
+  const ctx=cv.getContext("2d");
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,cv.width,cv.height);
+  const pad=40, W=cv.width-pad-10, H=cv.height-pad-10;
+  const xs=D.map(p=>p[ai]), ys=D.map(p=>p[bi]);
+  const xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys);
+  const sx=v=>pad+(v-xmin)/((xmax-xmin)||1)*W;
+  const sy=v=>10+H-(v-ymin)/((ymax-ymin)||1)*H;
+  // axes
+  ctx.strokeStyle="#94a3b8";ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(pad,10);ctx.lineTo(pad,10+H);ctx.lineTo(pad+W,10+H);ctx.stroke();
+  ctx.fillStyle="#475569";ctx.font="11px system-ui";
+  ctx.fillText(na+" ("+(ev[ai]*100).toFixed(1)+"%)",pad,10+H+18);
+  ctx.fillText(nb+" ("+(ev[bi]*100).toFixed(1)+"%)",pad+W-90,pad-14>0?pad-14:8);
+  const colors=["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#0891b2","#db2777","#65a30d"];
+  for(let i=0;i<D.length;i++){
+    ctx.fillStyle=colors[labels[i]%colors.length];
+    ctx.beginPath();ctx.arc(sx(D[i][ai]),sy(D[i][bi]),4,0,Math.PI*2);ctx.fill();
+    ctx.strokeStyle="#fff";ctx.lineWidth=1;ctx.stroke();
+  }
+}
+
+// ---------- main ----------
+function fmt(x,d=3){return Number(x).toFixed(d);}
+document.getElementById("run").addEventListener("click",()=>{
+  const errEl=document.getElementById("err"); errEl.textContent="";
+  try{
+    const {labels:rowLabels, X, dropped} = parseMatrix(document.getElementById("input").value);
+    const n=X.length;
+    if(n<8) throw new Error("Need at least 8 data rows for meaningful statistics.");
+    const kmode=document.getElementById("kmode").value;
+    const ncompSel=parseInt(document.getElementById("ncomp").value);
+    const restarts=Math.max(1,parseInt(document.getElementById("iters").value)||25);
+
+    const {scores, varKept, k:ncomp} = pca(X, ncompSel);
+    // randomness metric computed on standardized features projected to PC space
+    const hop = hopkins(scores);
+
+    // choose k
+    let k, bestSil=null, km=null;
+    const tryK=(kk)=>({res:kmeans(scores,kk,restarts), sil:silhouette(scores,kmeans(scores,kk,3).labels,kk)});
+    if(kmode==="auto"){
+      let best=null;
+      for(let kk=2;kk<=8;kk++){
+        const res=kmeans(scores,kk,restarts);
+        const s=silhouette(scores,res.labels,kk);
+        if(best===null||s>best.s)best={kk,res,s};
+      }
+      k=best.kk; km=best.res; bestSil=best.s;
+    }else{
+      k=parseInt(kmode);
+      km=kmeans(scores,k,restarts);
+      bestSil=silhouette(scores,km.labels,k);
+    }
+
+    // random labeling baseline
+    const rnd=mulberry(12345);
+    const sils=[];
+    for(let t=0;t<200;t++){
+      const perm=new Array(n);for(let i=0;i<n;i++)perm[i]=i;
+      for(let i=n-1;i>0;i--){const j=Math.floor(rnd()*(i+1));[perm[i],perm[j]]=[perm[j],perm[i]];}
+      const fake=perm.map(i=>i%k);
+      sils.push(silhouette(scores,fake,k));
+    }
+    const mu=mean(sils);
+    const sd=Math.sqrt(mean(sils.map(s=>(s-mu)*(s-mu))))||1e-9;
+    const z=(bestSil-mu)/sd;
+
+    // fill UI
+    document.getElementById("results").style.display="block";
+    document.getElementById("hopkins").textContent=fmt(hop);
+    document.getElementById("hopkinsBar").style.width=Math.min(100,hop*100)+"%";
+    document.getElementById("sil").textContent=fmt(bestSil);
+    document.getElementById("silBar").style.width=Math.min(100,Math.max(0,bestSil*100))+"%";
+    document.getElementById("randSil").textContent=fmt(mu);
+    document.getElementById("zscore").textContent=fmt(z,1);
+    document.getElementById("nrows").textContent=n;
+    document.getElementById("ndropped").textContent=dropped;
+    document.getElementById("ndropped").textContent=dropped;
+    document.getElementById("nfeat").textContent=X[0].length;
+    document.getElementById("ncompUsed").textContent=ncomp+" ("+fmt(varKept*100,1)+"%)";
+    document.getElementById("kUsed").textContent=k;
+    const counts={};km.labels.forEach(l=>counts[l]=(counts[l]||0)+1);
+    document.getElementById("sizes").textContent=Object.entries(counts).map(([c,cnt])=>c+":"+cnt).join(", ");
+
+    let verdict, color;
+    const hopHi = hop>=0.7, hopLo = hop<0.55, zHi = z>3, zLo = z<2;
+    if(hopLo && zLo) {verdict="Looks random / no real structure";color="#b91c1c";}
+    else if(hopHi && zHi) {verdict="Strong, non-random structure";color="#16a34a";}
+    else if(hopHi && !zHi) {verdict="Disagreement: cluster tendency exists, but clusters found are weak";color="#d97706";}
+    else if(!hopLo && zHi) {verdict="Disagreement: clusters separate better than chance despite uniform spread";color="#d97706";}
+    else if(zHi) {verdict="Structure present (moderate spatial clustering)";color="#d97706";}
+    else if(hopHi) {verdict="Spatial cluster tendency, but low cluster quality";color="#b45309";}
+    else {verdict="Weak / ambiguous structure";color="#b45309";}
+    const v=document.getElementById("verdict");v.textContent=verdict;v.style.color=color;
+
+    document.getElementById("interp").textContent =
+      "How to read this: Hopkins near 0.5 means points are spread like random noise (no cluster tendency); above ~0.7 indicates distinct clusters exist in the data. The silhouette measures how well-separated the found clusters are (-1..1, higher is better). The z-score compares your clustering's silhouette against 200 random labelings of the same data: a value above ~2 means the clustering is significantly better than chance, i.e. the cluster assignment is not random.";
+
+    // plots
+    const ev=scores[0].map((_,j)=>0); // per-component variance ratio approximated below
+    // compute variance ratio per component from scores
+    for(let j=0;j<scores[0].length;j++){const col=scores.map(r=>r[j]);const m=mean(col);
+      ev[j]=col.reduce((s,v)=>s+(v-m)*(v-m),0)/col.length;}
+    const names=scores[0].map((_,j)=>"PC"+(j+1));
+    scatter(document.getElementById("plot12"),scores,km.labels,k,0,1,names[0],names[1],ev);
+    scatter(document.getElementById("plot13"),scores,km.labels,k,0,Math.min(2,scores[0].length-1),names[0],names[Math.min(2,scores[0].length-1)]||names[1],ev);
+
+    // table — sorted by datetime, oldest to newest (DD/MM/YYYY format)
+    const parseDate = s => {
+      const dmy = String(s).trim().match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/);
+      if(dmy){
+        const d=+dmy[1], m=+dmy[2];
+        let y=+dmy[3]; if(y<100) y+=2000;
+        return Date.UTC(y, m-1, d, (String(s).match(/\d{1,2}:\d{2}/)||["0:0"])[0].split(":")[0]||0);
+      }
+      const t=Date.parse(s);
+      return isFinite(t)?t:NaN;
+    };
+    const order = rowLabels.map((r,i)=>i)
+      .sort((a,b)=>{
+        const da=parseDate(rowLabels[a][2]), db=parseDate(rowLabels[b][2]);
+        const ta=isFinite(da)?da:Infinity, tb=isFinite(db)?db:Infinity;
+        if(ta!==tb) return ta-tb;
+        return String(rowLabels[a][2]).localeCompare(String(rowLabels[b][2]));
+      });
+    const tbl=document.getElementById("tbl");
+    let html="<tr><th>idx</th><th>day</th><th>datetime</th><th>hour</th><th>cluster</th></tr>";
+    const colors=["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#0891b2","#db2777","#65a30d"];
+    for(const i of order){
+      html+="<tr>"+rowLabels[i].map(c=>"<td>"+c+"</td>").join("")+
+        "<td><span class='cluster-legend' style='background:"+colors[km.labels[i]%colors.length]+"'></span>"+km.labels[i]+"</td></tr>";
+    }
+    tbl.innerHTML=html;
+
+    // ---------- year calendar ----------
+    // map each calendar day -> tally of cluster labels
+    const dayClusters = {}; // "y-m-d" -> {cluster: count}
+    for(let i=0;i<n;i++){
+      const t=parseDate(rowLabels[i][2]);
+      if(!isFinite(t)) continue;
+      const dt=new Date(t);
+      const key=dt.getUTCFullYear()+"-"+dt.getUTCMonth()+"-"+dt.getUTCDate();
+      (dayClusters[key]=dayClusters[key]||{});
+      dayClusters[key][km.labels[i]]=(dayClusters[key][km.labels[i]]||0)+1;
+    }
+    const years=[...new Set(Object.keys(dayClusters).map(kk=>+kk.split("-")[0]))].sort();
+    const monthNames=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const dayNames=["Mo","Tu","We","Th","Fr","Sa","Su"];
+    const palette=["#2563eb","#dc2626","#16a34a","#d97706","#7c3aed","#0891b2","#db2777","#65a30d"];
+    const calEl=document.getElementById("calendar");
+    let calHtml="";
+    for(const y of years){
+      calHtml+="<div style='width:100%'><b style='font-size:.95rem'>"+y+"</b></div>";
+      for(let mo=0;mo<12;mo++){
+        const first=new Date(Date.UTC(y,mo,1));
+        const dim=new Date(Date.UTC(y,mo+1,0)).getUTCDate();
+        const lead=(first.getUTCDay()+6)%7; // Monday-start
+        calHtml+="<div style='display:inline-block;vertical-align:top;margin:6px 10px 6px 0'>"+
+          "<div style='text-align:center;font-size:.78rem;color:#334155;margin-bottom:3px'>"+monthNames[mo]+" "+y+"</div>"+
+          "<table style='border-collapse:collapse;font-size:.7rem'><tr>"+dayNames.map(d=>"<th style='padding:1px 4px;color:#94a3b8'>"+d+"</th>").join("")+"</tr><tr>";
+        for(let c=0;c<lead;c++) calHtml+="<td></td>";
+        for(let d=1;d<=dim;d++){
+          const key=y+"-"+mo+"-"+d;
+          const tally=dayClusters[key];
+          let bg="#f1f5f9", border="#e2e8f0", extra="";
+          if(tally){
+            const cts=Object.entries(tally).sort((a,b)=>b[1]-a[1]);
+            if(cts.length===1){ bg=palette[cts[0][0]%palette.length]; border=bg; }
+            else{ // mixed day: gradient split by proportion
+              const tot=cts.reduce((s,c)=>s+c[1],0);
+              let acc=0, stops=[];
+              for(const [cl,cnt] of cts){ const p0=acc/tot*100; acc+=cnt; stops.push(palette[cl%palette.length]+" "+p0.toFixed(0)+"% "+(acc/tot*100).toFixed(0)+"%"); }
+              bg="linear-gradient(135deg,"+stops.join(",")+")";
+              border="#94a3b8";
+            }
+          }
+          calHtml+="<td title='"+y+"-"+monthNames[mo]+"-"+d+"' style='min-width:24px;height:22px;text-align:center;padding:1px 3px;border:1px solid "+border+";"+
+            (tally?"background:"+bg+";color:#fff;font-weight:600":"color:#94a3b8")+"'>"+d+"</td>";
+          if((lead+d)%7===0 && d<dim) calHtml+="</tr><tr>";
+        }
+        const cells=lead+dim;
+        for(let c=cells;c<Math.ceil(cells/7)*7;c++) calHtml+="<td></td>";
+        calHtml+="</tr></table></div>";
+      }
+    }
+    calEl.innerHTML=calHtml;
+    const present=[...new Set(km.labels)];
+    document.getElementById("calLegend").innerHTML=
+      "<b>Clusters:</b> "+present.sort((a,b)=>a-b).map(cl=>"<span class='cluster-legend' style='background:"+palette[cl%palette.length]+"'></span>cluster "+cl+" ("+(counts[cl]||0)+" rows)").join(" &nbsp; ")+
+      " &nbsp; <span class='cluster-legend' style='background:linear-gradient(135deg,#2563eb 0% 50%,#dc2626 50% 100%)'></span>mixed day &nbsp; <span class='cluster-legend' style='background:#f1f5f9;border:1px solid #e2e8f0'></span>no data";
+  }catch(e){ errEl.textContent=e.message; }
+});
+</script>
+</body>
+</html>
